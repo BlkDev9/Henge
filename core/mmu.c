@@ -550,7 +550,40 @@ static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTl
     if (__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) e->write_tag = HV_TLB_INVALID;
 }
 
+/* HV_KVA_HIST (measuring, for a kernel fastmem window): which kernel VAs get TLB fills, per GB from the bottom of xnu's
+   kernel VA space, and how many distinct 16 KB pages. hv_kva_hist_dump writes it out. */
+#define KVA_GBS 2048 /* buckets: 2048 of 1 GB from 0xfffffe0000000000 by default; HV_KVA_BASE (hex) and HV_KVA_SHIFT move and widen them */
+static uint64_t KVA_BASE = 0xfffffe0000000000ull;
+static int kva_shift = 30;
+static uint64_t kva_fills[KVA_GBS], kva_pages_n[KVA_GBS], kva_below, kva_above;
+static uint8_t *kva_seen; /* one bit per page */
+static int kva_on = -1;
+static void kva_note(uint64_t va) {
+    if (kva_on < 0) {
+        kva_on = getenv("HV_KVA_HIST") != NULL;
+        if (getenv("HV_KVA_BASE")) KVA_BASE = strtoull(getenv("HV_KVA_BASE"), NULL, 16);
+        if (getenv("HV_KVA_SHIFT")) kva_shift = atoi(getenv("HV_KVA_SHIFT"));
+    }
+    if (!kva_on) return;
+    if (!kva_seen) kva_seen = calloc((size_t)KVA_GBS << (kva_shift - HV_TLB_PAGE_BITS - 3), 1);
+    if (va < KVA_BASE) { __atomic_add_fetch(&kva_below, 1, __ATOMIC_RELAXED); return; }
+    uint64_t off = va - KVA_BASE, gb = off >> kva_shift;
+    if (gb >= KVA_GBS) { __atomic_add_fetch(&kva_above, 1, __ATOMIC_RELAXED); return; }
+    __atomic_add_fetch(&kva_fills[gb], 1, __ATOMIC_RELAXED);
+    uint64_t pg = off >> HV_TLB_PAGE_BITS;
+    uint8_t bit = (uint8_t)(1u << (pg & 7));
+    if (!(__atomic_fetch_or(&kva_seen[pg >> 3], bit, __ATOMIC_RELAXED) & bit)) __atomic_add_fetch(&kva_pages_n[gb], 1, __ATOMIC_RELAXED);
+}
+
+void hv_kva_hist_dump(FILE *f) {
+    if (kva_on <= 0) return;
+    fprintf(f, "kva below %llu above %llu (outside %d buckets of 2^%d bytes from %llx)\n", (unsigned long long)kva_below, (unsigned long long)kva_above, KVA_GBS, kva_shift, (unsigned long long)KVA_BASE);
+    for (int g = 0; g < KVA_GBS; g++)
+        if (kva_fills[g]) fprintf(f, "kva gb %d fills %llu pages %llu\n", g, (unsigned long long)kva_fills[g], (unsigned long long)kva_pages_n[g]);
+}
+
 static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
+    if ((va >> 55) & 1) kva_note(va & ~(uint64_t)PAGE_MASK);
     if (w->block_size < (1ull << HV_TLB_PAGE_BITS)) return; /* smaller guest pages: slow path only */
     HvRam *ram = ram_of(cpu->m, w->pa);
     if (!ram) return;
@@ -686,6 +719,9 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
     int el = table ? 1 : 0;
     uint64_t off = va & PAGE_MASK;
     if (off + bytes > PAGE_MASK + 1) return 1; /* crosses into the next page: the helper */
+    /* In the page, but where the fast check cannot pass (it allows HV_TLB_ADJ bytes of every access, so a small one in a
+       page's last HV_TLB_ADJ bytes misses): a refill would come straight back here. */
+    if (bytes <= HV_TLB_ADJ + 1 && off + HV_TLB_ADJ > PAGE_MASK) return 1;
     HvWalk w;
     walk_begin(cpu);
     hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
